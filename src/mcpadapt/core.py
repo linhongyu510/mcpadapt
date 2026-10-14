@@ -66,7 +66,7 @@ class ToolAdapter(ABC):
         format. This needs to be adapted to the desired Agent framework.
 
         Note that the function is asynchronous (a coroutine) you can use
-        :meth:`ToolAdapter.adapt` if you need to use it synchronously.
+        :meth:`ToolAdapter.adapt` if you need to use the tool synchronously.
 
         Args:
             afunc: The coroutine to be called.
@@ -168,7 +168,7 @@ class MCPAdapt:
     >>> adapter.close()
 
     >>> # sync usage with streamable-http
-    >>> with MCPAdapt({"url": "http://127.0.0.1:8000/mcp", "transport": "streamable-http"), SmolAgentsAdapter()) as tools:
+    >>> with MCPAdapt({"url": "http://127.0.0.1:8000/mcp", "transport": "streamable-http"}), SmolAgentsAdapter()) as tools:
     >>>     print(tools)
 
     >>> # async usage
@@ -176,7 +176,7 @@ class MCPAdapt:
     >>>     print(tools)
 
     >>> # async usage with sse
-    >>> async with MCPAdapt({"url": "http://127.0.0.1:8000/sse"), SmolAgentsAdapter()) as tools:
+    >>> async with MCPAdapt({"url": "http://127.0.0.1:8000/sse"}), SmolAgentsAdapter()) as tools:
     >>>     print(tools)
     """
 
@@ -195,7 +195,7 @@ class MCPAdapt:
         Args:
             serverparams (StdioServerParameters | dict[str, Any] | list[StdioServerParameters | dict[str, Any]]):
                 MCP server parameters (stdio or sse). Can be a list if you want to connect multiple MCPs at once.
-            adapter (ToolAdapter): Adapter to use to convert MCP tools call into agentic framework tools
+            adapter (ToolAdapter): Adapter to use to convert MCP tools call into agentic framework tools.
             connect_timeout (int): Connection timeout in seconds to the mcp server (default is 30s).
             client_session_timeout_seconds: Timeout for MCP ClientSession calls
 
@@ -359,8 +359,8 @@ class MCPAdapt:
     async def atools(self) -> list[Any]:
         """Returns the tools from the MCP server adapted to the desired Agent framework.
 
-        This is what is yielded if it's a context manager otherwise you can access it
-        directly via this method.
+        This is what is yielded if used as an async context manager otherwise you can
+        access it directly via this method.
 
         Only use this when you start the client in asynchronous context.
 
