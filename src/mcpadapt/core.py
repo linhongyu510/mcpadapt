@@ -176,7 +176,7 @@ class MCPAdapt:
     >>>     print(tools)
 
     >>> # async usage with sse
-    >>> async with MCPAdapt({"url": "http://127.0.0.1:8000/sse"}), SmolAgentsAdapter()) as tools:
+    >>> async with MCPAdapt({"url": "http://127.0.0.1:8000/sse"}, SmolAgentsAdapter()) as tools:
     >>>     print(tools)
     """
 
