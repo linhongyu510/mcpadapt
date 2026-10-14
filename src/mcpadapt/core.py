@@ -6,6 +6,7 @@ basic interfaces and classes for adapting tools from MCP to the desired Agent fr
 
 import asyncio
 import copy
+import logging
 import threading
 from abc import ABC, abstractmethod
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -65,7 +66,7 @@ class ToolAdapter(ABC):
         format. This needs to be adapted to the desired Agent framework.
 
         Note that the function is asynchronous (a coroutine) you can use
-        :meth:`ToolAdapter.adapt` if you need to use the tool synchronously.
+        :meth:`ToolAdapter.adapt` if you need to use it synchronously.
 
         Args:
             afunc: The coroutine to be called.
@@ -167,7 +168,7 @@ class MCPAdapt:
     >>> adapter.close()
 
     >>> # sync usage with streamable-http
-    >>> with MCPAdapt({"url": "http://127.0.0.1:8000/mcp", "transport": "streamable-http"}), SmolAgentsAdapter()) as tools:
+    >>> with MCPAdapt({"url": "http://127.0.0.1:8000/mcp", "transport": "streamable-http"), SmolAgentsAdapter()) as tools:
     >>>     print(tools)
 
     >>> # async usage
@@ -175,7 +176,7 @@ class MCPAdapt:
     >>>     print(tools)
 
     >>> # async usage with sse
-    >>> async with MCPAdapt({"url": "http://127.0.0.1:8000/sse"}, SmolAgentsAdapter()) as tools:
+    >>> async with MCPAdapt({"url": "http://127.0.0.1:8000/sse"), SmolAgentsAdapter()) as tools:
     >>>     print(tools)
     """
 
@@ -194,7 +195,7 @@ class MCPAdapt:
         Args:
             serverparams (StdioServerParameters | dict[str, Any] | list[StdioServerParameters | dict[str, Any]]):
                 MCP server parameters (stdio or sse). Can be a list if you want to connect multiple MCPs at once.
-            adapter (ToolAdapter): Adapter to use to convert MCP tools call into agentic framework tools.
+            adapter (ToolAdapter): Adapter to use to convert MCP tools call into agentic framework tools
             connect_timeout (int): Connection timeout in seconds to the mcp server (default is 30s).
             client_session_timeout_seconds: Timeout for MCP ClientSession calls
 
@@ -218,6 +219,7 @@ class MCPAdapt:
         self.task = None
 
         self.ready = threading.Event()
+        self._shutdown_requested = threading.Event()
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
 
         self.connect_timeout = connect_timeout
@@ -240,6 +242,10 @@ class MCPAdapt:
                 await asyncio.Event().wait()  # Keep session alive until stopped
 
         self.task = self.loop.create_task(setup())
+        # close() may have landed before the task existed: honour the shutdown
+        # request immediately instead of racing setup against the join in close().
+        if self._shutdown_requested.is_set():
+            self.task.cancel()
         try:
             self.loop.run_until_complete(self.task)
         except asyncio.CancelledError:
@@ -294,13 +300,49 @@ class MCPAdapt:
         self.thread.start()
 
         # check connection to mcp server is ready
-        if not self.ready.wait(timeout=self.connect_timeout):
+        try:
+            ready = self.ready.wait(timeout=self.connect_timeout)
+        except BaseException:
+            # The wait was interrupted (e.g. KeyboardInterrupt): the partial
+            # startup must be rolled back before the interruption propagates,
+            # since __exit__ is not called when __enter__ raises.
+            self._rollback_partial_startup()
+            raise
+
+        if not ready:
+            self._rollback_partial_startup()
             raise TimeoutError(
                 f"Couldn't connect to the MCP server after {self.connect_timeout} seconds"
             )
 
+    def _rollback_partial_startup(self) -> None:
+        """Tear down the partially started synchronous runtime.
+
+        Invoked when :meth:`start` gives up waiting for readiness: either the
+        connect timeout elapsed, or the wait itself was interrupted. The
+        background thread, its event loop and the spawned stdio child are torn
+        down through :meth:`close`, the same path used by a normal exit.
+
+        Cleanup errors must not replace the exception that triggered the
+        rollback: they are logged instead. Note that :meth:`close` joins the
+        background thread without a timeout; if the event loop cannot be
+        cancelled, this call blocks by design and the partial startup cannot
+        be reaped in that case.
+        """
+        try:
+            self.close()
+        except BaseException as cleanup_exc:
+            logging.getLogger(__name__).warning(
+                "Error while rolling back a partially started MCPAdapt",
+                exc_info=cleanup_exc,
+            )
+
     def close(self):
         """Clean up resources and stop the client."""
+        # Record the shutdown request first: the startup thread may not have
+        # assigned ``self.task`` yet, in which case cancelling right here would
+        # be impossible. The thread honours this event as soon as it creates the task.
+        self._shutdown_requested.set()
         if self.task and not self.task.done():
             self.loop.call_soon_threadsafe(self.task.cancel)
         self.thread.join()  # will wait until the task is cancelled to join thread (as it's blocked Event().wait())
@@ -317,8 +359,8 @@ class MCPAdapt:
     async def atools(self) -> list[Any]:
         """Returns the tools from the MCP server adapted to the desired Agent framework.
 
-        This is what is yielded if used as an async context manager otherwise you can
-        access it directly via this method.
+        This is what is yielded if it's a context manager otherwise you can access it
+        directly via this method.
 
         Only use this when you start the client in asynchronous context.
 
