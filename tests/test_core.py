@@ -564,3 +564,94 @@ def test_client_session_timeout_parameter_propagation(echo_server_script):
         DummyAdapter(),
     )
     assert adapter_default.client_session_timeout_seconds == 5
+
+
+# --- Regression: failed start()/__enter__ must roll back partial resources ---
+
+import threading  # noqa: E402
+import sys  # noqa: E402
+
+# A valid FastMCP stdio server that deliberately cold-starts much later than the
+# connect_timeout: the command is runnable and correct, it just never answers
+# ``initialize`` in time. This mirrors a hung / very slow MCP server, not a
+# contract violation.
+_HUNG_SERVER_SCRIPT = (
+    "import time\n"
+    "time.sleep(30)\n"
+    "from mcp.server.fastmcp import FastMCP\n"
+    "mcp = FastMCP('Hung')\n"
+    "@mcp.tool()\n"
+    "def echo_tool(text: str) -> str:\n"
+    "    return 'Echo: ' + text\n"
+    "mcp.run()\n"
+)
+
+
+def _hung_params():
+    return StdioServerParameters(
+        command=sys.executable, args=["-c", _HUNG_SERVER_SCRIPT]
+    )
+
+
+def test_connect_timeout_rolls_back_thread_loop_and_task():
+    """A timed-out start() must not leak the loop thread, task or event loop.
+
+    Regression test: when readiness times out, ``start`` used to raise
+    ``TimeoutError`` without tearing the partially-started connection down.
+    Because ``__enter__`` raised, ``__exit__``/``close`` was never invoked,
+    leaving the ``_run_loop`` thread blocked, the task pending, the event loop
+    open and the owned subprocess alive.
+    """
+    adapter = MCPAdapt(_hung_params(), DummyAdapter(), connect_timeout=1)
+
+    with pytest.raises(
+        TimeoutError, match="Couldn't connect to the MCP server after 1 seconds"
+    ):
+        adapter.start()
+
+    # Rollback must have cancelled the task, joined the loop thread and closed
+    # the event loop.
+    assert adapter.task is not None
+    assert adapter.task.done(), "setup task was not cancelled on rollback"
+    assert not adapter.thread.is_alive(), "_run_loop thread leaked after failed start"
+    assert adapter.loop.is_closed(), "event loop leaked after failed start"
+
+
+def test_context_manager_timeout_rolls_back():
+    """The `with` path (__enter__ raises) must still roll back."""
+    adapter = MCPAdapt(_hung_params(), DummyAdapter(), connect_timeout=1)
+    with pytest.raises(TimeoutError):
+        with adapter:  # __enter__ raises -> __exit__ must NOT be relied upon
+            pass
+
+    assert not adapter.thread.is_alive(), (
+        "_run_loop thread leaked after __enter__ timeout"
+    )
+    assert adapter.loop.is_closed(), "event loop leaked after __enter__ timeout"
+
+
+def test_no_dangling_run_loop_thread_after_timeout():
+    """No background thread targeting ``_run_loop`` may survive a failed start."""
+    before = {t.ident for t in threading.enumerate()}
+    adapter = MCPAdapt(_hung_params(), DummyAdapter(), connect_timeout=1)
+    with pytest.raises(TimeoutError):
+        adapter.start()
+    survivors = [
+        t for t in threading.enumerate() if t.ident not in before and t.is_alive()
+    ]
+    assert survivors == [], f"leaked background threads after timeout: {survivors}"
+
+
+def test_close_idempotent_after_successful_start(echo_server_script):
+    """close() may be safely called twice (success path stays idempotent)."""
+    adapter = MCPAdapt(
+        StdioServerParameters(command=sys.executable, args=["-c", echo_server_script]),
+        DummyAdapter(),
+        connect_timeout=15,
+    )
+    with adapter as tools:
+        assert len(tools) == 1
+    # Already closed by __exit__; a second close must not raise.
+    adapter.close()
+    assert not adapter.thread.is_alive()
+    assert adapter.loop.is_closed()

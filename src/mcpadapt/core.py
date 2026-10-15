@@ -167,7 +167,7 @@ class MCPAdapt:
     >>> adapter.close()
 
     >>> # sync usage with streamable-http
-    >>> with MCPAdapt({"url": "http://127.0.0.1:8000/mcp", "transport": "streamable-http"}), SmolAgentsAdapter()) as tools:
+    >>> with MCPAdapt({"url": "http://127.0.0.1:8000/mcp", "transport": "streamable-http"), SmolAgentsAdapter()) as tools:
     >>>     print(tools)
 
     >>> # async usage
@@ -175,7 +175,7 @@ class MCPAdapt:
     >>>     print(tools)
 
     >>> # async usage with sse
-    >>> async with MCPAdapt({"url": "http://127.0.0.1:8000/sse"}, SmolAgentsAdapter()) as tools:
+    >>> async with MCPAdapt({"url": "http://127.0.0.1:8000/sse"), SmolAgentsAdapter()) as tools:
     >>>     print(tools)
     """
 
@@ -295,16 +295,41 @@ class MCPAdapt:
 
         # check connection to mcp server is ready
         if not self.ready.wait(timeout=self.connect_timeout):
+            # Readiness never happened (e.g. a valid stdio configuration whose
+            # server cold-starts slowly or never answers ``initialize``). The
+            # background thread, its task, the event loop and the owned child
+            # process are not reaped automatically in this path: ``__exit__`` is
+            # not invoked because ``__enter__`` (which calls ``start``) raised.
+            # Roll the partial connection back before raising so we don't leak a
+            # thread / subprocess / event loop on a failed start.
+            self._teardown()
             raise TimeoutError(
                 f"Couldn't connect to the MCP server after {self.connect_timeout} seconds"
             )
 
+    def _teardown(self):
+        """Cancel the setup task, join the loop thread and close the loop.
+
+        This is the single place that owns the background thread/task/loop and the
+        transport it created. It is idempotent and safe to call both on a fully
+        started client (``close`` / ``__exit__``) and on a client whose ``start``
+        timed out (rollback), as well as when the worker thread has already died
+        on its own (e.g. a transport-start error).
+        """
+        task = self.task
+        if task is not None and not task.done():
+            # Cancelling the setup task unwinds the AsyncExitStack, which in turn
+            # closes the transport and reaps the owned child process.
+            self.loop.call_soon_threadsafe(task.cancel)
+        # ``join`` waits for the worker to finish unwinding (cancellation +
+        # transport teardown) before we close the loop.
+        self.thread.join()
+        if not self.loop.is_closed():
+            self.loop.close()
+
     def close(self):
         """Clean up resources and stop the client."""
-        if self.task and not self.task.done():
-            self.loop.call_soon_threadsafe(self.task.cancel)
-        self.thread.join()  # will wait until the task is cancelled to join thread (as it's blocked Event().wait())
-        self.loop.close()  # we won't be using the loop anymore we can safely close it
+        self._teardown()
 
     def __enter__(self):
         self.start()
@@ -317,8 +342,8 @@ class MCPAdapt:
     async def atools(self) -> list[Any]:
         """Returns the tools from the MCP server adapted to the desired Agent framework.
 
-        This is what is yielded if used as an async context manager otherwise you can
-        access it directly via this method.
+        This is what is yielded if used as a context manager otherwise you can access it
+        directly via this method.
 
         Only use this when you start the client in asynchronous context.
 
